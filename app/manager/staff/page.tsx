@@ -24,27 +24,27 @@ type Position = {
   name: string;
 };
 
-type Invitation = {
+type AccountRequest = {
   id: number;
   first_name: string;
   last_name: string;
   email: string;
+  role: "employee" | "manager";
   created_at: string;
-  expires_at: string;
-  status: "pending" | "expired";
-  invited_role: "employee" | "manager";
-  positions: string[];
 };
 
 export default function StaffManagementPage() {
   const [staff, setStaff] = useState<StaffMember[]>([]);
   const [positions, setPositions] = useState<Position[]>([]);
-  const [invitations, setInvitations] = useState<Invitation[]>([]);
-  const [currentRole, setCurrentRole] = useState<"manager" | "owner" | null>(null);
+  const [requests, setRequests] = useState<AccountRequest[]>([]);
+
+  const [currentRole, setCurrentRole] = useState<
+    "manager" | "owner" | null
+  >(null);
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [sendingInvite, setSendingInvite] = useState(false);
+  const [processingId, setProcessingId] = useState<number | null>(null);
 
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -55,36 +55,43 @@ export default function StaffManagementPage() {
   const [liquorCardType, setLiquorCardType] = useState<CardType>("none");
   const [liquorCardExpiresOn, setLiquorCardExpiresOn] = useState("");
 
-  const [inviteRole, setInviteRole] = useState<"employee" | "manager">("employee");
-  const [showInviteForm, setShowInviteForm] = useState(false);
-  const [inviteFirstName, setInviteFirstName] = useState("");
-  const [inviteLastName, setInviteLastName] = useState("");
-  const [inviteEmail, setInviteEmail] = useState("");
-  const [invitePositionIds, setInvitePositionIds] = useState<number[]>([]);
-
   const loadData = useCallback(async () => {
     try {
       const responses = await Promise.all([
         fetch("/api/manager/staff"),
         fetch("/api/manager/staff", { method: "OPTIONS" }),
-        fetch("/api/manager/invitations"),
+        fetch("/api/manager/approvals"),
         fetch("/api/manager/permissions"),
       ]);
 
       if (responses.some((response) => !response.ok)) {
-        throw new Error("Load failed");
+        throw new Error("Failed to load staff information.");
       }
 
-      const [staffData, positionData, invitationData, permissionData] =
-        await Promise.all(responses.map((response) => response.json()));
+      const [
+        staffData,
+        positionData,
+        requestData,
+        permissionData,
+      ] = await Promise.all(
+        responses.map((response) => response.json())
+      );
 
       setStaff(staffData as StaffMember[]);
       setPositions(positionData as Position[]);
-      setInvitations(invitationData as Invitation[]);
-      setCurrentRole(permissionData.role === "owner" ? "owner" : "manager");
+      setRequests(requestData as AccountRequest[]);
+
+      setCurrentRole(
+        permissionData.role === "owner" ? "owner" : "manager"
+      );
+
       setError("");
-    } catch {
-      setError("Could not load staff information.");
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Could not load staff information."
+      );
     } finally {
       setLoading(false);
     }
@@ -94,24 +101,81 @@ export default function StaffManagementPage() {
     void loadData();
   }, [loadData]);
 
+  async function handleApproval(
+    request: AccountRequest,
+    action: "approve" | "deny"
+  ) {
+    const name = `${request.first_name} ${request.last_name}`;
+
+    const confirmed = window.confirm(
+      `Are you sure you want to ${action} ${name}'s ${request.role} account?`
+    );
+
+    if (!confirmed) return;
+
+    setProcessingId(request.id);
+    setError("");
+    setMessage("");
+
+    try {
+      const response = await fetch("/api/manager/approvals", {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          userId: request.id,
+          action,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data.error || "Failed to process account request."
+        );
+      }
+
+      await loadData();
+
+      setMessage(
+        action === "approve"
+          ? `${name}'s ${request.role} account was approved.`
+          : `${name}'s account request was denied.`
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Something went wrong."
+      );
+    } finally {
+      setProcessingId(null);
+    }
+  }
+
   function startEditing(member: StaffMember) {
     setEditingId(member.id);
+
     setSelectedPositions(
       positions
-        .filter((position) => member.positions.includes(position.name))
+        .filter((position) =>
+          member.positions.includes(position.name)
+        )
         .map((position) => position.id)
     );
+
     setDateOfBirth(member.date_of_birth ?? "");
     setLiquorCardType(member.liquor_card_type ?? "none");
     setLiquorCardExpiresOn(member.liquor_card_expires_on ?? "");
+
     setError("");
     setMessage("");
   }
 
-  function togglePosition(id: number, invitation = false) {
-    const setter = invitation ? setInvitePositionIds : setSelectedPositions;
-
-    setter((current) =>
+  function togglePosition(id: number) {
+    setSelectedPositions((current) =>
       current.includes(id)
         ? current.filter((positionId) => positionId !== id)
         : [...current, id]
@@ -131,7 +195,9 @@ export default function StaffManagementPage() {
     try {
       const response = await fetch("/api/manager/staff", {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify({
           userId: member.id,
           ...(member.role === "employee"
@@ -140,14 +206,18 @@ export default function StaffManagementPage() {
           dateOfBirth: dateOfBirth || null,
           liquorCardType,
           liquorCardExpiresOn:
-            liquorCardType === "none" ? null : liquorCardExpiresOn,
+            liquorCardType === "none"
+              ? null
+              : liquorCardExpiresOn,
         }),
       });
 
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.error || "Failed to update staff member.");
+        throw new Error(
+          data.error || "Failed to update staff member."
+        );
       }
 
       setEditingId(null);
@@ -158,7 +228,9 @@ export default function StaffManagementPage() {
       );
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "Something went wrong."
+        err instanceof Error
+          ? err.message
+          : "Something went wrong."
       );
     } finally {
       setSaving(false);
@@ -168,8 +240,8 @@ export default function StaffManagementPage() {
   async function removeEmployee(member: StaffMember) {
     const confirmed = window.confirm(
       `Remove ${member.first_name} ${member.last_name}?\n\n` +
-      "Their account will be deactivated and upcoming published shifts " +
-      "released for pickup. This cannot be undone from Staff Management."
+        "Their account will be deactivated and upcoming published shifts " +
+        "released for pickup. This cannot be undone from Staff Management."
     );
 
     if (!confirmed) return;
@@ -187,7 +259,9 @@ export default function StaffManagementPage() {
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.error || "Failed to remove employee.");
+        throw new Error(
+          data.error || "Failed to remove employee."
+        );
       }
 
       setEditingId(null);
@@ -195,102 +269,16 @@ export default function StaffManagementPage() {
 
       setMessage(
         `${member.first_name} ${member.last_name} was removed. ` +
-        `${data.releasedShifts} upcoming shift(s) released.`
+          `${data.releasedShifts} upcoming shift(s) released.`
       );
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "Something went wrong."
+        err instanceof Error
+          ? err.message
+          : "Something went wrong."
       );
     } finally {
       setSaving(false);
-    }
-  }
-
-  function openInvitation(role: "employee" | "manager") {
-    if (role === "manager" && currentRole !== "owner") return;
-
-    setInviteRole(role);
-    setShowInviteForm(true);
-    setInviteFirstName("");
-    setInviteLastName("");
-    setInviteEmail("");
-    setInvitePositionIds([]);
-    setError("");
-    setMessage("");
-  }
-
-  async function sendInvitation(
-    event: React.FormEvent<HTMLFormElement>
-  ) {
-    event.preventDefault();
-
-    const firstName = inviteFirstName.trim();
-    const lastName = inviteLastName.trim();
-    const email = inviteEmail.trim();
-
-    if (!firstName || !lastName) {
-      setError("First and last name are required.");
-      return;
-    }
-
-    if (inviteRole === "employee" && !invitePositionIds.length) {
-      setError("Select at least one position for the employee.");
-      return;
-    }
-
-    if (inviteRole === "manager" && !email) {
-      setError("A manager must have an email address.");
-      return;
-    }
-
-    if (inviteRole === "manager" && currentRole !== "owner") {
-      setError("Only owners can invite managers.");
-      return;
-    }
-
-    setSendingInvite(true);
-    setError("");
-    setMessage("");
-
-    try {
-      const response = await fetch("/api/manager/invitations", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          firstName,
-          lastName,
-          email: email || null,
-          positionIds:
-            inviteRole === "manager" ? [] : invitePositionIds,
-          role: inviteRole,
-        }),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || "Failed to send invitation.");
-      }
-
-      setShowInviteForm(false);
-      setInviteFirstName("");
-      setInviteLastName("");
-      setInviteEmail("");
-      setInvitePositionIds([]);
-
-      await loadData();
-
-      setMessage(
-        email
-          ? `Invitation sent to ${email}.`
-          : `${firstName} ${lastName} was added as an employee.`
-      );
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Something went wrong."
-      );
-    } finally {
-      setSendingInvite(false);
     }
   }
 
@@ -442,7 +430,7 @@ export default function StaffManagementPage() {
             </h1>
 
             <p className="mt-2 text-gray-600">
-              Manage your restaurant&apos;s employees and positions.
+              Manage employees, managers, and account requests.
             </p>
           </div>
 
@@ -451,154 +439,11 @@ export default function StaffManagementPage() {
               {staff.length} Staff Members
             </span>
 
-            <button
-              type="button"
-              onClick={() =>
-                showInviteForm && inviteRole === "employee"
-                  ? setShowInviteForm(false)
-                  : openInvitation("employee")
-              }
-              className="rounded-lg bg-gray-900 px-5 py-2 text-sm font-semibold text-white"
-            >
-              + Invite Employee
-            </button>
-
-            {currentRole === "owner" && (
-              <button
-                type="button"
-                onClick={() =>
-                  showInviteForm && inviteRole === "manager"
-                    ? setShowInviteForm(false)
-                    : openInvitation("manager")
-                }
-                className="rounded-lg bg-green-700 px-5 py-2 text-sm font-semibold text-white"
-              >
-                + Invite Manager
-              </button>
-            )}
+            <span className="rounded-lg bg-amber-100 px-4 py-2 text-sm font-medium text-amber-800">
+              {requests.length} Pending Requests
+            </span>
           </div>
         </div>
-
-        {showInviteForm && (
-          <section className="mt-6 rounded-xl bg-white p-6 shadow-sm">
-            <h2 className="text-xl font-semibold text-gray-900">
-              Invite New{" "}
-              {inviteRole === "manager" ? "Manager" : "Employee"}
-            </h2>
-
-            <p className="mt-2 text-sm text-gray-600">
-              {inviteRole === "manager"
-                ? "Send an email invitation for a manager account. Only owners can do this. Invitations expire after 48 hours."
-                : "Enter an email to invite an employee to create an account, or leave it blank to add them to the schedule without login access. Invitations expire after 48 hours."}
-            </p>
-
-            <form onSubmit={sendInvitation} className="mt-6 space-y-5">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <label className="block text-sm font-medium text-gray-700">
-                  First Name
-                  <input
-                    type="text"
-                    required
-                    maxLength={100}
-                    value={inviteFirstName}
-                    onChange={(e) =>
-                      setInviteFirstName(e.target.value)
-                    }
-                    className="mt-2 w-full rounded-lg border border-gray-300 px-4 py-3 text-gray-900"
-                  />
-                </label>
-
-                <label className="block text-sm font-medium text-gray-700">
-                  Last Name
-                  <input
-                    type="text"
-                    required
-                    maxLength={100}
-                    value={inviteLastName}
-                    onChange={(e) =>
-                      setInviteLastName(e.target.value)
-                    }
-                    className="mt-2 w-full rounded-lg border border-gray-300 px-4 py-3 text-gray-900"
-                  />
-                </label>
-              </div>
-
-              <label className="block text-sm font-medium text-gray-700">
-                Email Address{" "}
-                {inviteRole === "manager"
-                  ? "(required)"
-                  : "(optional)"}
-
-                <input
-                  type="email"
-                  required={inviteRole === "manager"}
-                  value={inviteEmail}
-                  onChange={(e) =>
-                    setInviteEmail(e.target.value)
-                  }
-                  className="mt-2 w-full rounded-lg border border-gray-300 px-4 py-3 text-gray-900"
-                />
-              </label>
-
-              {inviteRole === "employee" && (
-                <fieldset>
-                  <legend className="text-sm font-semibold text-gray-900">
-                    Assign Positions
-                  </legend>
-
-                  <p className="mt-1 text-sm text-gray-600">
-                    Select every position this employee can work.
-                  </p>
-
-                  <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                    {positions.map((position) => (
-                      <label
-                        key={position.id}
-                        className="flex items-center gap-3 rounded-lg border border-gray-200 p-3 text-sm text-gray-800"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={invitePositionIds.includes(
-                            position.id
-                          )}
-                          onChange={() =>
-                            togglePosition(position.id, true)
-                          }
-                          disabled={sendingInvite}
-                        />
-                        {position.name}
-                      </label>
-                    ))}
-                  </div>
-                </fieldset>
-              )}
-
-              <div className="flex justify-end gap-3">
-                <button
-                  type="button"
-                  onClick={() => setShowInviteForm(false)}
-                  disabled={sendingInvite}
-                  className="rounded-lg border border-gray-300 px-5 py-3 text-sm font-medium text-gray-700"
-                >
-                  Cancel
-                </button>
-
-                <button
-                  type="submit"
-                  disabled={sendingInvite || loading}
-                  className="rounded-lg bg-gray-900 px-5 py-3 text-sm font-semibold text-white disabled:opacity-50"
-                >
-                  {sendingInvite
-                    ? "Sending..."
-                    : inviteRole === "employee" &&
-                        !inviteEmail.trim()
-                      ? "Add Employee"
-                      : "Send Invitation"}
-                </button>
-              </div>
-            </form>
-          </section>
-        )}
 
         {error && (
           <div
@@ -622,75 +467,110 @@ export default function StaffManagementPage() {
           <p className="mt-8 text-gray-600">Loading staff...</p>
         ) : (
           <>
+            {/* ACCOUNT REQUESTS */}
             <section className="mt-8">
-              <h2 className="mb-4 text-xl font-semibold text-gray-900">
-                Pending Invitations ({invitations.length})
-              </h2>
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                <h2 className="text-xl font-semibold text-gray-900">
+                  Pending Account Requests ({requests.length})
+                </h2>
+
+                <button
+                  type="button"
+                  onClick={() => void loadData()}
+                  className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+                >
+                  Refresh Requests
+                </button>
+              </div>
 
               <div className="overflow-hidden rounded-xl bg-white shadow-sm">
-                {!invitations.length ? (
+                {!requests.length ? (
                   <p className="p-6 text-sm text-gray-600">
-                    No pending invitations.
+                    No pending account requests.
                   </p>
                 ) : (
                   <div className="divide-y divide-gray-100">
-                    {invitations.map((invitation) => (
+                    {requests.map((request) => (
                       <div
-                        key={invitation.id}
-                        className="flex flex-wrap items-start justify-between gap-4 p-5"
+                        key={request.id}
+                        className="flex flex-wrap items-center justify-between gap-4 p-5"
                       >
                         <div>
                           <h3 className="font-semibold text-gray-900">
-                            {invitation.first_name}{" "}
-                            {invitation.last_name}
+                            {request.first_name}{" "}
+                            {request.last_name}
                           </h3>
 
                           <p className="mt-1 text-sm text-gray-600">
-                            {invitation.email}
+                            {request.email}
                           </p>
 
-                          <span className="mt-2 inline-block rounded-full bg-blue-100 px-3 py-1 text-xs font-semibold capitalize text-blue-800">
-                            {invitation.invited_role || "employee"}
-                          </span>
+                          <div className="mt-3 flex flex-wrap items-center gap-2">
+                            <span
+                              className={`rounded-full px-3 py-1 text-xs font-semibold capitalize ${
+                                request.role === "manager"
+                                  ? "bg-green-100 text-green-800"
+                                  : "bg-blue-100 text-blue-800"
+                              }`}
+                            >
+                              {request.role}
+                            </span>
 
-                          <div className="mt-3 flex flex-wrap gap-2">
-                            {invitation.positions.map((position) => (
-                              <span
-                                key={position}
-                                className="rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-700"
-                              >
-                                {position}
-                              </span>
-                            ))}
+                            <span className="text-xs text-gray-500">
+                              Requested{" "}
+                              {new Date(
+                                request.created_at
+                              ).toLocaleDateString()}
+                            </span>
                           </div>
-
-                          <p className="mt-3 text-xs text-gray-500">
-                            Invited{" "}
-                            {new Date(
-                              invitation.created_at
-                            ).toLocaleDateString()}
-                          </p>
                         </div>
 
-                        <span
-                          className={`rounded-full px-3 py-1 text-xs font-semibold ${
-                            invitation.status === "pending"
-                              ? "bg-amber-100 text-amber-800"
-                              : "bg-red-100 text-red-800"
-                          }`}
-                        >
-                          {invitation.status === "pending"
-                            ? "Awaiting Acceptance"
-                            : "Expired"}
-                        </span>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void handleApproval(
+                                request,
+                                "approve"
+                              )
+                            }
+                            disabled={processingId !== null}
+                            className="rounded-lg bg-green-700 px-4 py-2 text-sm font-semibold text-white hover:bg-green-800 disabled:opacity-50"
+                          >
+                            {processingId === request.id
+                              ? "Processing..."
+                              : "Approve"}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void handleApproval(
+                                request,
+                                "deny"
+                              )
+                            }
+                            disabled={processingId !== null}
+                            className="rounded-lg border border-red-300 px-4 py-2 text-sm font-semibold text-red-700 hover:bg-red-50 disabled:opacity-50"
+                          >
+                            Deny
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
                 )}
               </div>
+
+              <p className="mt-3 text-sm text-gray-600">
+                Approved accounts can log in immediately.
+                Both Managers and Owners can review Employee
+                and Manager requests.
+              </p>
             </section>
 
-            <section className="mt-8">
+            {/* EMPLOYEES */}
+            <section className="mt-10">
               <h2 className="mb-4 text-xl font-semibold text-gray-900">
                 Employees ({employees.length})
               </h2>
@@ -712,7 +592,8 @@ export default function StaffManagementPage() {
                             </h3>
 
                             <p className="mt-1 text-sm text-gray-600">
-                              {employee.email || "No email / no login"}
+                              {employee.email ||
+                                "No email / no login"}
                             </p>
                           </div>
 
@@ -770,6 +651,7 @@ export default function StaffManagementPage() {
               </div>
             </section>
 
+            {/* MANAGEMENT */}
             <section className="mt-10">
               <h2 className="mb-4 text-xl font-semibold text-gray-900">
                 Management ({managers.length})

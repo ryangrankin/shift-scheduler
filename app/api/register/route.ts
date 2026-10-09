@@ -1,4 +1,3 @@
-
 import { NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
@@ -10,6 +9,7 @@ const registerSchema = z.object({
   email: z.email(),
   password: z.string().min(8),
   restaurantId: z.number().int().positive(),
+  role: z.enum(["employee", "manager"]),
 });
 
 export async function POST(request: Request) {
@@ -30,6 +30,7 @@ export async function POST(request: Request) {
       email,
       password,
       restaurantId,
+      role,
     } = parsed.data;
 
     const restaurant = await pool.query(
@@ -46,23 +47,26 @@ export async function POST(request: Request) {
 
     const passwordHash = await bcrypt.hash(password, 12);
 
-    const result = await pool.query(
+    await pool.query(
       `INSERT INTO users
        (restaurant_id, first_name, last_name,
-        email, password_hash, role)
-       VALUES ($1, $2, $3, $4, $5, 'employee')
-       RETURNING id, first_name, last_name, email, role`,
+        email, password_hash, role, is_active, approval_status)
+       VALUES ($1, $2, $3, $4, $5, $6, FALSE, 'pending')`,
       [
         restaurantId,
         firstName,
         lastName,
         email.toLowerCase(),
         passwordHash,
+        role,
       ]
     );
 
     return NextResponse.json(
-      { user: result.rows[0] },
+      {
+        message:
+          "Registration submitted. Your account is pending management approval.",
+      },
       { status: 201 }
     );
   } catch (error: unknown) {
