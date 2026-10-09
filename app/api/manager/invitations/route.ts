@@ -8,19 +8,11 @@ import { z } from "zod";
 const invitationSchema = z.object({
   firstName: z.string().trim().min(1).max(100),
   lastName: z.string().trim().min(1).max(100),
-
-  // Email is now optional.
   email: z
-    .union([
-      z.email().trim().toLowerCase(),
-      z.literal(""),
-      z.null(),
-    ])
+    .union([z.email().trim().toLowerCase(), z.literal(""), z.null()])
     .optional(),
-
-  positionIds: z
-    .array(z.number().int().positive())
-    .min(1),
+  positionIds: z.array(z.number().int().positive()).default([]),
+  role: z.enum(["employee", "manager"]).default("employee"),
 });
 
 export async function POST(request: Request) {
@@ -39,47 +31,32 @@ export async function POST(request: Request) {
 
   if (!parsed.success) {
     return NextResponse.json(
-      { error: "Invalid employee information" },
+      { error: "Invalid invitation information" },
       { status: 400 }
     );
   }
 
-  const {
-    firstName,
-    lastName,
-    email: rawEmail,
-    positionIds,
-  } = parsed.data;
-
-  // Convert empty string to null.
-  const email =
-    typeof rawEmail === "string" &&
-    rawEmail.trim() !== ""
-      ? rawEmail.trim().toLowerCase()
-      : null;
+  const { firstName, lastName, positionIds, role } = parsed.data;
+  const email = parsed.data.email?.trim().toLowerCase() || null;
 
   const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
 
-    // ------------------------------------------------------------
-    // Verify manager
-    // ------------------------------------------------------------
-
-    const managerResult = await client.query(
+    // Verify the current user.
+    const actorResult = await client.query(
       `SELECT id, restaurant_id, role
        FROM users
-       WHERE id = $1`,
+       WHERE id = $1
+         AND role IN ('manager', 'owner')
+         AND is_active = TRUE`,
       [session.user.id]
     );
 
-    const manager = managerResult.rows[0];
+    const actor = actorResult.rows[0];
 
-    if (
-      !manager ||
-      !["manager", "owner"].includes(manager.role)
-    ) {
+    if (!actor) {
       await client.query("ROLLBACK");
 
       return NextResponse.json(
@@ -88,72 +65,75 @@ export async function POST(request: Request) {
       );
     }
 
-    // ------------------------------------------------------------
-    // Validate positions
-    // ------------------------------------------------------------
-
-    const positionResult = await client.query(
-      `SELECT id
-       FROM positions
-       WHERE restaurant_id = $1
-         AND id = ANY($2::int[])`,
-      [manager.restaurant_id, positionIds]
-    );
-
-    if (
-      positionResult.rows.length !==
-      new Set(positionIds).size
-    ) {
+    // Only Owners can invite managers.
+    if (role === "manager" && actor.role !== "owner") {
       await client.query("ROLLBACK");
 
       return NextResponse.json(
-        { error: "One or more positions are invalid" },
+        { error: "Only owners can invite managers" },
+        { status: 403 }
+      );
+    }
+
+    // Manager accounts must have an email.
+    if (role === "manager" && !email) {
+      await client.query("ROLLBACK");
+
+      return NextResponse.json(
+        { error: "Manager invitations require an email address" },
         { status: 400 }
       );
     }
 
-    // ============================================================
-    // NO EMAIL
-    //
-    // Create the employee directly.
-    // They can be scheduled and managed, but they don't have
-    // employee login access yet.
-    // ============================================================
+    // Employees must have at least one position.
+    if (role === "employee" && positionIds.length === 0) {
+      await client.query("ROLLBACK");
 
-    if (!email) {
-      const employeeResult = await client.query(
-        `INSERT INTO users (
-           restaurant_id,
-           first_name,
-           last_name,
-           email,
-           role,
-           is_active
-         )
-         VALUES ($1, $2, $3, NULL, 'employee', TRUE)
-         RETURNING id, first_name, last_name, email, role`,
-        [
-          manager.restaurant_id,
-          firstName,
-          lastName,
-        ]
+      return NextResponse.json(
+        { error: "Select at least one position for the employee" },
+        { status: 400 }
+      );
+    }
+
+    // Validate positions.
+    const uniquePositionIds = [...new Set(positionIds)];
+
+    if (uniquePositionIds.length > 0) {
+      const positionResult = await client.query(
+        `SELECT id
+         FROM positions
+         WHERE restaurant_id = $1
+           AND id = ANY($2::int[])`,
+        [actor.restaurant_id, uniquePositionIds]
       );
 
-      const employee =
-        employeeResult.rows[0];
+      if (positionResult.rows.length !== uniquePositionIds.length) {
+        await client.query("ROLLBACK");
 
-      // Assign positions immediately.
-      for (const positionId of positionIds) {
+        return NextResponse.json(
+          { error: "One or more positions are invalid" },
+          { status: 400 }
+        );
+      }
+    }
+
+    // Employees without email addresses are added directly.
+    if (!email) {
+      const employeeResult = await client.query(
+        `INSERT INTO users
+           (restaurant_id, first_name, last_name, email, role, is_active)
+         VALUES ($1, $2, $3, NULL, 'employee', TRUE)
+         RETURNING id, first_name, last_name, email, role`,
+        [actor.restaurant_id, firstName, lastName]
+      );
+
+      const employee = employeeResult.rows[0];
+
+      for (const positionId of uniquePositionIds) {
         await client.query(
-          `INSERT INTO user_positions (
-             user_id,
-             position_id
-           )
+          `INSERT INTO user_positions (user_id, position_id)
            VALUES ($1, $2)`,
-          [
-            employee.id,
-            positionId,
-          ]
+          [employee.id, positionId]
         );
       }
 
@@ -163,20 +143,14 @@ export async function POST(request: Request) {
         {
           success: true,
           type: "employee",
-          message:
-            "Employee added successfully",
+          message: "Employee added successfully",
           employee,
         },
         { status: 201 }
       );
     }
 
-    // ============================================================
-    // EMAIL PROVIDED
-    //
-    // Existing invitation flow.
-    // ============================================================
-
+    // Check for an existing account.
     const existingUser = await client.query(
       `SELECT id
        FROM users
@@ -188,112 +162,94 @@ export async function POST(request: Request) {
       await client.query("ROLLBACK");
 
       return NextResponse.json(
-        {
-          error:
-            "An account with this email already exists",
-        },
+        { error: "An account with this email already exists" },
         { status: 409 }
       );
     }
 
+    // Generate a secure invitation token.
     const token = randomBytes(32).toString("hex");
 
     const tokenHash = createHash("sha256")
       .update(token)
       .digest("hex");
 
-    const invitationResult =
-      await client.query(
-        `INSERT INTO employee_invitations (
+    // Save invitation with its assigned role.
+    const invitationResult = await client.query(
+      `INSERT INTO employee_invitations
+         (
            restaurant_id,
            invited_by,
            first_name,
            last_name,
            email,
            token_hash,
-           expires_at
+           expires_at,
+           invited_role
          )
-         VALUES (
-           $1,
-           $2,
-           $3,
-           $4,
-           $5,
-           $6,
-           NOW() + INTERVAL '48 hours'
-         )
-         RETURNING id`,
-        [
-          manager.restaurant_id,
-          manager.id,
-          firstName,
-          lastName,
-          email,
-          tokenHash,
-        ]
-      );
+       VALUES (
+         $1, $2, $3, $4, $5, $6,
+         NOW() + INTERVAL '48 hours',
+         $7
+       )
+       RETURNING id`,
+      [
+        actor.restaurant_id,
+        actor.id,
+        firstName,
+        lastName,
+        email,
+        tokenHash,
+        role,
+      ]
+    );
 
-    const invitationId =
-      invitationResult.rows[0].id;
+    const invitationId = invitationResult.rows[0].id;
 
     // Assign positions to the invitation.
-    for (const positionId of positionIds) {
+    for (const positionId of uniquePositionIds) {
       await client.query(
-        `INSERT INTO employee_invitation_positions (
-           invitation_id,
-           position_id
-         )
+        `INSERT INTO employee_invitation_positions
+           (invitation_id, position_id)
          VALUES ($1, $2)`,
-        [
-          invitationId,
-          positionId,
-        ]
+        [invitationId, positionId]
       );
     }
 
-    const baseUrl =
-      process.env.APP_URL ||
-      "http://localhost:3001";
+    // Build invitation link.
+    const baseUrl = (
+      process.env.APP_URL || "http://localhost:3001"
+    ).replace(/\/$/, "");
 
-    const invitationLink =
-      `${baseUrl}/invite/${token}`;
+    const invitationLink = `${baseUrl}/invite/${token}`;
 
-    const resend = new Resend(
-      process.env.RESEND_API_KEY
-    );
+    // Send invitation email.
+    const resend = new Resend(process.env.RESEND_API_KEY);
 
-    const emailResult =
-      await resend.emails.send({
-        from:
-          process.env.RESEND_FROM_EMAIL ||
-          "Shift Scheduler <onboarding@resend.dev>",
+    const emailResult = await resend.emails.send({
+      from:
+        process.env.RESEND_FROM_EMAIL ||
+        "Shift Scheduler <onboarding@resend.dev>",
 
-        to: email,
+      to: email,
 
-        subject:
-          "You're invited to Shift Scheduler",
+      subject: "You're invited to Shift Scheduler",
 
-        text:
-          `Hi ${firstName},\n\n` +
-          `You've been invited to join your restaurant's Shift Scheduler.\n\n` +
-          `Create your account here:\n${invitationLink}\n\n` +
-          `This invitation expires in 48 hours.\n\n` +
-          `If you weren't expecting this invitation, you can ignore this email.`,
-      });
+      text:
+        `Hi ${firstName},\n\n` +
+        `You've been invited to join your restaurant's Shift Scheduler as a ${role}.\n\n` +
+        `Create your account here:\n${invitationLink}\n\n` +
+        `This invitation expires in 48 hours.\n\n` +
+        `If you weren't expecting this invitation, you can ignore this email.`,
+    });
 
     if (emailResult.error) {
       await client.query("ROLLBACK");
 
-      console.error(
-        "Resend invitation error:",
-        emailResult.error
-      );
+      console.error("Resend invitation error:", emailResult.error);
 
       return NextResponse.json(
-        {
-          error:
-            "Failed to send invitation email",
-        },
+        { error: "Failed to send invitation email" },
         { status: 502 }
       );
     }
@@ -304,18 +260,14 @@ export async function POST(request: Request) {
       {
         success: true,
         type: "invitation",
-        message:
-          "Invitation sent successfully",
+        message: "Invitation sent successfully",
       },
       { status: 201 }
     );
   } catch (error) {
     await client.query("ROLLBACK");
 
-    console.error(
-      "Create employee/invitation error:",
-      error
-    );
+    console.error("Create employee/invitation error:", error);
 
     if (
       typeof error === "object" &&
@@ -324,19 +276,13 @@ export async function POST(request: Request) {
       error.code === "23505"
     ) {
       return NextResponse.json(
-        {
-          error:
-            "A pending invitation or employee already exists",
-        },
+        { error: "A pending invitation or employee already exists" },
         { status: 409 }
       );
     }
 
     return NextResponse.json(
-      {
-        error:
-          "Failed to create employee or invitation",
-      },
+      { error: "Failed to create employee or invitation" },
       { status: 500 }
     );
   } finally {
@@ -355,19 +301,18 @@ export async function GET() {
   }
 
   try {
-    const managerResult = await pool.query(
+    const actorResult = await pool.query(
       `SELECT restaurant_id, role
        FROM users
-       WHERE id = $1`,
+       WHERE id = $1
+         AND role IN ('manager', 'owner')
+         AND is_active = TRUE`,
       [session.user.id]
     );
 
-    const manager = managerResult.rows[0];
+    const actor = actorResult.rows[0];
 
-    if (
-      !manager ||
-      !["manager", "owner"].includes(manager.role)
-    ) {
+    if (!actor) {
       return NextResponse.json(
         { error: "Manager access required" },
         { status: 403 }
@@ -382,17 +327,15 @@ export async function GET() {
          ei.email,
          ei.created_at,
          ei.expires_at,
+         ei.invited_role,
          CASE
            WHEN ei.expires_at <= NOW()
              THEN 'expired'
            ELSE 'pending'
          END AS status,
          COALESCE(
-           ARRAY_AGG(
-             p.name
-             ORDER BY p.name
-           )
-           FILTER (WHERE p.id IS NOT NULL),
+           ARRAY_AGG(p.name ORDER BY p.name)
+             FILTER (WHERE p.id IS NOT NULL),
            '{}'
          ) AS positions
        FROM employee_invitations ei
@@ -400,19 +343,17 @@ export async function GET() {
          ON eip.invitation_id = ei.id
        LEFT JOIN positions p
          ON p.id = eip.position_id
+         AND p.restaurant_id = ei.restaurant_id
        WHERE ei.restaurant_id = $1
          AND ei.accepted_at IS NULL
        GROUP BY ei.id
        ORDER BY ei.created_at DESC`,
-      [manager.restaurant_id]
+      [actor.restaurant_id]
     );
 
     return NextResponse.json(result.rows);
   } catch (error) {
-    console.error(
-      "Load invitations error:",
-      error
-    );
+    console.error("Load invitations error:", error);
 
     return NextResponse.json(
       { error: "Failed to load invitations" },

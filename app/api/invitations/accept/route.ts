@@ -56,8 +56,44 @@ export async function POST(request: Request) {
       );
     }
 
+    // Only employee and manager accounts can be created through invitations.
+    const invitedRole = invitation.invited_role;
+
+    if (invitedRole !== "employee" && invitedRole !== "manager") {
+      await client.query("ROLLBACK");
+
+      return NextResponse.json(
+        { error: "Invalid invitation role" },
+        { status: 400 }
+      );
+    }
+
+    // Manager invitations must have been issued by an owner.
+    if (invitedRole === "manager") {
+      const ownerResult = await client.query(
+        `SELECT 1
+         FROM users
+         WHERE id = $1
+           AND restaurant_id = $2
+           AND role = 'owner'
+           AND is_active = TRUE`,
+        [invitation.invited_by, invitation.restaurant_id]
+      );
+
+      if (ownerResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        return NextResponse.json(
+          { error: "Manager invitation is not authorized" },
+          { status: 403 }
+        );
+      }
+    }
+
     const existingUser = await client.query(
-      `SELECT id FROM users WHERE LOWER(email) = LOWER($1)`,
+      `SELECT id
+       FROM users
+       WHERE LOWER(email) = LOWER($1)`,
       [invitation.email]
     );
 
@@ -72,10 +108,11 @@ export async function POST(request: Request) {
 
     const passwordHash = await bcrypt.hash(password, 12);
 
+    // Create account using the role stored in the invitation.
     const userResult = await client.query(
       `INSERT INTO users
          (restaurant_id, first_name, last_name, email, password_hash, role)
-       VALUES ($1, $2, $3, $4, $5, 'employee')
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id`,
       [
         invitation.restaurant_id,
@@ -83,12 +120,13 @@ export async function POST(request: Request) {
         invitation.last_name,
         invitation.email,
         passwordHash,
+        invitedRole,
       ]
     );
 
     const userId = userResult.rows[0].id;
 
-    // Copy the invited positions onto the new employee.
+    // Copy assigned positions to the new account.
     await client.query(
       `INSERT INTO user_positions (user_id, position_id)
        SELECT $1, eip.position_id
@@ -99,6 +137,7 @@ export async function POST(request: Request) {
       [userId, invitation.id, invitation.restaurant_id]
     );
 
+    // Mark invitation as accepted.
     await client.query(
       `UPDATE employee_invitations
        SET accepted_at = NOW()
@@ -111,6 +150,7 @@ export async function POST(request: Request) {
     return NextResponse.json({
       success: true,
       message: "Account created successfully",
+      role: invitedRole,
     });
   } catch (error) {
     await client.query("ROLLBACK");
@@ -118,7 +158,7 @@ export async function POST(request: Request) {
     console.error("Accept invitation error:", error);
 
     return NextResponse.json(
-      { error: "Failed to create employee account" },
+      { error: "Failed to create account" },
       { status: 500 }
     );
   } finally {
