@@ -9,15 +9,30 @@ type Restaurant = {
   created_at: string;
 };
 
+type ManagerRequest = {
+  id: number;
+  first_name: string;
+  last_name: string;
+  email: string;
+  created_at: string;
+  restaurant_id: number;
+  restaurant_name: string;
+};
+
 export default function RestaurantManagementPage() {
   const [restaurants, setRestaurants] = useState<Restaurant[]>([]);
+  const [managerRequests, setManagerRequests] = useState<ManagerRequest[]>([]);
+
   const [name, setName] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [processingId, setProcessingId] = useState<number | null>(null);
+
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [accessDenied, setAccessDenied] = useState(false);
 
+  // Load restaurants
   const loadRestaurants = useCallback(async () => {
     try {
       const response = await fetch("/api/admin/restaurants");
@@ -31,11 +46,10 @@ export default function RestaurantManagementPage() {
         throw new Error("Failed to load restaurants.");
       }
 
-      const data = await response.json();
+      const data: Restaurant[] = await response.json();
 
       setRestaurants(data);
       setAccessDenied(false);
-      setError("");
     } catch (err) {
       setError(
         err instanceof Error ? err.message : "Something went wrong."
@@ -45,10 +59,31 @@ export default function RestaurantManagementPage() {
     }
   }, []);
 
+  // Load pending first-manager requests
+  const loadManagerRequests = useCallback(async () => {
+    try {
+      const response = await fetch("/api/admin/manager-approvals");
+
+      if (!response.ok) {
+        throw new Error("Failed to load Manager requests.");
+      }
+
+      const data: ManagerRequest[] = await response.json();
+
+      setManagerRequests(data);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Something went wrong."
+      );
+    }
+  }, []);
+
   useEffect(() => {
     void loadRestaurants();
-  }, [loadRestaurants]);
+    void loadManagerRequests();
+  }, [loadRestaurants, loadManagerRequests]);
 
+  // Add restaurant
   async function addRestaurant(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
@@ -80,6 +115,7 @@ export default function RestaurantManagementPage() {
 
       setName("");
       await loadRestaurants();
+
       setMessage(`${data.name} was added successfully.`);
     } catch (err) {
       setError(
@@ -87,6 +123,46 @@ export default function RestaurantManagementPage() {
       );
     } finally {
       setSaving(false);
+    }
+  }
+
+  // Approve or deny a first-manager request
+  async function handleManagerApproval(
+    userId: number,
+    action: "approve" | "deny"
+  ) {
+    setProcessingId(userId);
+    setError("");
+    setMessage("");
+
+    try {
+      const response = await fetch("/api/admin/manager-approvals", {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ userId, action }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to process request.");
+      }
+
+      await loadManagerRequests();
+
+      setMessage(
+        action === "approve"
+          ? "Manager approved successfully."
+          : "Manager request denied."
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Something went wrong."
+      );
+    } finally {
+      setProcessingId(null);
     }
   }
 
@@ -137,7 +213,7 @@ export default function RestaurantManagementPage() {
           </h1>
 
           <p className="mt-2 text-gray-600">
-            Add and manage restaurants available in your scheduling app.
+            Add restaurants and approve their first Managers.
           </p>
         </div>
 
@@ -166,8 +242,7 @@ export default function RestaurantManagementPage() {
           </h2>
 
           <p className="mt-2 text-sm text-gray-600">
-            Restaurants you add will eventually appear in the
-            registration dropdown.
+            Restaurants you add will appear in the registration dropdown.
           </p>
 
           <form onSubmit={addRestaurant} className="mt-5">
@@ -195,6 +270,74 @@ export default function RestaurantManagementPage() {
               {saving ? "Adding..." : "+ Add Restaurant"}
             </button>
           </form>
+        </section>
+
+        {/* FIRST MANAGER APPROVALS */}
+        <section className="mt-8 rounded-xl bg-white p-6 shadow-sm">
+          <h2 className="text-xl font-semibold text-gray-900">
+            New Restaurant Manager Requests
+          </h2>
+
+          <p className="mt-2 text-sm text-gray-600">
+            Approve the first Manager for a new restaurant.
+            Once approved, they can manage their own staff and
+            registration requests.
+          </p>
+
+          {managerRequests.length === 0 ? (
+            <p className="mt-5 text-sm text-gray-500">
+              No pending first-Manager requests.
+            </p>
+          ) : (
+            <div className="mt-5 divide-y divide-gray-200">
+              {managerRequests.map((request) => (
+                <div
+                  key={request.id}
+                  className="flex flex-wrap items-center justify-between gap-4 py-4"
+                >
+                  <div>
+                    <p className="font-semibold text-gray-900">
+                      {request.first_name} {request.last_name}
+                    </p>
+
+                    <p className="text-sm text-gray-600">
+                      {request.email}
+                    </p>
+
+                    <p className="mt-1 text-sm font-medium text-gray-800">
+                      Restaurant: {request.restaurant_name}
+                    </p>
+                  </div>
+
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      disabled={processingId !== null}
+                      onClick={() =>
+                        handleManagerApproval(request.id, "approve")
+                      }
+                      className="rounded-lg bg-green-700 px-4 py-2 text-sm font-semibold text-white hover:bg-green-800 disabled:opacity-50"
+                    >
+                      {processingId === request.id
+                        ? "Processing..."
+                        : "Approve"}
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={processingId !== null}
+                      onClick={() =>
+                        handleManagerApproval(request.id, "deny")
+                      }
+                      className="rounded-lg bg-red-700 px-4 py-2 text-sm font-semibold text-white hover:bg-red-800 disabled:opacity-50"
+                    >
+                      Deny
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </section>
 
         {/* RESTAURANT LIST */}
