@@ -1,7 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+
+type Restaurant = {
+  id: number;
+  name: string;
+};
 
 export default function RegisterPage() {
   const router = useRouter();
@@ -11,17 +16,50 @@ export default function RegisterPage() {
     lastName: "",
     email: "",
     password: "",
-    restaurantId: "1",
+    restaurantId: "",
     role: "employee",
   });
+
+  const [restaurants, setRestaurants] = useState<Restaurant[]>([]);
+  const [restaurantsLoading, setRestaurantsLoading] = useState(true);
 
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
 
+  useEffect(() => {
+    async function loadRestaurants() {
+      try {
+        const response = await fetch("/api/restaurants");
+
+        if (!response.ok) {
+          throw new Error("Failed to load restaurants.");
+        }
+
+        const data: Restaurant[] = await response.json();
+
+        setRestaurants(data);
+      } catch {
+        setError(
+          "Could not load restaurants. Please refresh the page."
+        );
+      } finally {
+        setRestaurantsLoading(false);
+      }
+    }
+
+    void loadRestaurants();
+  }, []);
+
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setError("");
+
+    if (!form.restaurantId) {
+      setError("Please select your restaurant.");
+      return;
+    }
+
     setLoading(true);
 
     try {
@@ -83,7 +121,7 @@ export default function RegisterPage() {
         </h1>
 
         <p className="mb-6 text-gray-600">
-          Register for access to your restaurant's schedule.
+          Register for access to your restaurant&apos;s schedule.
           All accounts require management approval.
         </p>
 
@@ -133,12 +171,53 @@ export default function RegisterPage() {
             className="w-full rounded-lg border border-gray-300 p-3 text-gray-900"
           />
 
+          {/* RESTAURANT DROPDOWN */}
           <div>
-            <label className="mb-2 block text-sm font-medium text-gray-700">
+            <label
+              htmlFor="restaurant"
+              className="mb-2 block text-sm font-medium text-gray-700"
+            >
+              Select Your Restaurant
+            </label>
+
+            <select
+              id="restaurant"
+              required
+              value={form.restaurantId}
+              onChange={(e) =>
+                setForm({ ...form, restaurantId: e.target.value })
+              }
+              disabled={restaurantsLoading || restaurants.length === 0}
+              className="w-full rounded-lg border border-gray-300 bg-white p-3 text-gray-900 disabled:opacity-50"
+            >
+              <option value="">
+                {restaurantsLoading
+                  ? "Loading restaurants..."
+                  : "Choose a restaurant"}
+              </option>
+
+              {restaurants.map((restaurant) => (
+                <option
+                  key={restaurant.id}
+                  value={restaurant.id}
+                >
+                  {restaurant.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* ROLE SELECTION */}
+          <div>
+            <label
+              htmlFor="role"
+              className="mb-2 block text-sm font-medium text-gray-700"
+            >
               Register As
             </label>
 
             <select
+              id="role"
               value={form.role}
               onChange={(e) =>
                 setForm({ ...form, role: e.target.value })
@@ -152,7 +231,11 @@ export default function RegisterPage() {
 
           <button
             type="submit"
-            disabled={loading}
+            disabled={
+              loading ||
+              restaurantsLoading ||
+              restaurants.length === 0
+            }
             className="w-full rounded-lg bg-gray-900 p-3 font-semibold text-white hover:bg-gray-700 disabled:opacity-50"
           >
             {loading ? "Submitting..." : "Request Account"}
